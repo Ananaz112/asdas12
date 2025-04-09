@@ -1,0 +1,309 @@
+import os
+import json
+import requests
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+from time import sleep
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# Настройка логгирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('crypto_analyzer.log', encoding='utf-8')
+    ])
+logger = logging.getLogger(__name__)
+
+# Загрузка конфигурации
+load_dotenv()
+API_KEY = os.getenv('CRYPTORANK_API_KEY')
+TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
+DB_FILE = 'crypto_analyzer_db.json'  # Единый файл для всех данных
+BASE_URL = 'https://api.cryptorank.io/v2'
+
+
+class CryptoAnalyzer:
+
+    def __init__(self):
+        self.db_file = DB_FILE
+        self.data = self._load_or_create_db()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Accept': 'application/json',
+            'X-Api-Key': API_KEY
+        })
+
+    def _load_or_create_db(self):
+        """Загрузка или создание базы данных"""
+        if os.path.exists(self.db_file):
+            with open(self.db_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+
+        # Создаем новую структуру базы данных
+        new_db = {
+            'projects': {},
+            'categories': {},
+            'tags': {},
+            'metadata': {
+                'last_update': None,
+                'total_projects': 0,
+                'api_credits_used': 0,
+                'last_category_update': None
+            }
+        }
+        self._save_db(new_db)
+        return new_db
+
+    def _save_db(self, data=None):
+        """Сохранение базы данных"""
+        with open(self.db_file, 'w', encoding='utf-8') as f:
+            json.dump(data or self.data, f, indent=2, ensure_ascii=False)
+
+    def _make_api_request(self, endpoint, params=None):
+        """Выполнение API запроса"""
+        try:
+            response = self.session.get(f"{BASE_URL}/{endpoint}",
+                                        params=params,
+                                        timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()
+                credits = data.get('status', {}).get('usedCredits', 1)
+                self.data['metadata']['api_credits_used'] += credits
+                return {'success': True, 'data': data}
+            else:
+                return {
+                    'success': False,
+                    'error': f"HTTP {response.status_code}",
+                    'message': response.text
+                }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def fetch_all_categories(self):
+        """Получение всех категорий"""
+        logger.info("Загрузка категорий...")
+        result = self._make_api_request("currencies/categories")
+
+        if not result['success']:
+            logger.error(f"Ошибка загрузки категорий: {result['error']}")
+            return []
+
+        categories = result['data'].get('data', [])
+        self.data['categories'] = {cat['id']: cat for cat in categories}
+        self.data['metadata']['last_category_update'] = datetime.now(
+        ).isoformat()
+        self._save_db()
+
+        logger.info(f"Загружено {len(categories)} категорий")
+        return categories
+
+    def fetch_projects_by_category(self, category_id):
+        """Получение проектов по категории"""
+        params = {
+            'limit': 100,
+            'offset': 0,
+            'sortBy': 'rank',
+            'sortDirection': 'ASC',
+            'categoryId': category_id
+        }
+
+        all_projects = []
+        while True:
+            result = self._make_api_request("currencies", params)
+
+            if not result['success']:
+                logger.error(
+                    f"Ошибка загрузки проектов категории {category_id}: {result['error']}"
+                )
+                break
+
+            projects = result['data'].get('data', [])
+            if not projects:
+                break
+
+            all_projects.extend(projects)
+            params['offset'] += len(projects)
+            logger.info(
+                f"Категория {category_id}: загружено {len(projects)} проектов. Всего: {len(all_projects)}"
+            )
+
+            if len(projects) < params['limit']:
+                break
+
+        return all_projects
+
+    def update_all_projects(self):
+        """Обновление всех проектов по категориям"""
+        logger.info("Начало обновления проектов")
+
+        # Сначала обновляем список категорий
+        categories = self.fetch_all_categories()
+        if not categories:
+            return False
+
+        total_new = 0
+
+        for category in categories:
+            category_id = category['id']
+            logger.info(
+                f"Обработка категории: {category['name']} (ID: {category_id})")
+
+            projects = self.fetch_projects_by_category(category_id)
+            new_in_category = 0
+
+            for project in projects:
+                project_id = str(project['id'])
+
+                if project_id not in self.data['projects']:
+                    self.data['projects'][project_id] = {
+                        'id': project.get('id'),
+                        'name': project.get('name'),
+                        'symbol': project.get('symbol'),
+                        'price': project.get('price'),
+                        'marketCap': project.get('marketCap'),
+                        'volume24h': project.get('volume24h'),
+                        'categoryId': project.get('categoryId'),
+                        'url':
+                        f"https://cryptorank.io/price/{project.get('key', '')}",
+                        'added': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                        'last_updated': datetime.now().isoformat()
+                    }
+                    new_in_category += 1
+                else:
+                    # Обновляем существующий проект
+                    self.data['projects'][project_id].update({
+                        'price':
+                        project.get('price'),
+                        'marketCap':
+                        project.get('marketCap'),
+                        'volume24h':
+                        project.get('volume24h'),
+                        'last_updated':
+                        datetime.now().isoformat()
+                    })
+
+            logger.info(
+                f"Категория {category['name']}: добавлено {new_in_category} новых проектов"
+            )
+            total_new += new_in_category
+            sleep(1)  # Задержка между запросами
+
+        # Обновляем метаданные
+        self.data['metadata'].update({
+            'last_update':
+            datetime.now().isoformat(),
+            'total_projects':
+            len(self.data['projects']),
+            'new_projects':
+            total_new
+        })
+
+        self._save_db()
+        logger.info(
+            f"Обновление завершено. Всего проектов: {len(self.data['projects'])}, новых: {total_new}"
+        )
+        return True
+
+    def get_stats(self):
+        """Получение статистики"""
+        return {
+            'total_projects': len(self.data['projects']),
+            'total_categories': len(self.data['categories']),
+            'last_update': self.data['metadata'].get('last_update', 'никогда'),
+            'api_credits_used':
+            self.data['metadata'].get('api_credits_used', 0),
+            'new_projects': self.data['metadata'].get('new_projects', 0)
+        }
+
+    def get_recent_projects(self, count=10):
+        """Получение последних добавленных проектов"""
+        projects = list(self.data['projects'].values())
+        return sorted(projects, key=lambda x: x.get('added', ''),
+                      reverse=True)[:count]
+
+
+# Telegram Bot Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Crypto Analyzer Bot\n\n"
+                                    "Доступные команды:\n"
+                                    "/update - Обновить базу данных\n"
+                                    "/stats - Показать статистику\n"
+                                    "/projects - Показать последние проекты")
+
+
+async def update_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    analyzer = CryptoAnalyzer()
+    msg = await update.message.reply_text("🔄 Обновление базы данных...")
+
+    try:
+        if analyzer.update_all_projects():
+            stats = analyzer.get_stats()
+            response = (
+                f"✅ База данных обновлена\n"
+                f"Всего проектов: {stats['total_projects']}\n"
+                f"Новых проектов: {stats['new_projects']}\n"
+                f"Использовано кредитов API: {stats['api_credits_used']}\n"
+                f"Последнее обновление: {stats['last_update']}")
+            await msg.edit_text(response)
+        else:
+            await msg.edit_text("❌ Не удалось обновить базу данных")
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка при обновлении: {str(e)}")
+
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    analyzer = CryptoAnalyzer()
+    stats = analyzer.get_stats()
+
+    await update.message.reply_text(
+        f"📊 Статистика базы данных:\n"
+        f"• Всего проектов: {stats['total_projects']}\n"
+        f"• Всего категорий: {stats['total_categories']}\n"
+        f"• Последнее обновление: {stats['last_update']}\n"
+        f"• Использовано кредитов API: {stats['api_credits_used']}\n"
+        f"• Файл базы данных: {DB_FILE}")
+
+
+async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    analyzer = CryptoAnalyzer()
+    projects = analyzer.get_recent_projects(10)
+
+    if not projects:
+        await update.message.reply_text("В базе данных нет проектов")
+        return
+
+    message = "📋 Последние добавленные проекты:\n\n" + "\n".join(
+        f"{i}. {p['name']} ({p['symbol']}) - ${p.get('price', 'N/A')}\n"
+        f"   Капитализация: ${p.get('marketCap', 'N/A'):,}\n"
+        f"   Добавлен: {p['added']}\n"
+        f"   {p['url']}" for i, p in enumerate(projects, 1))
+
+    await update.message.reply_text(message[:4000])  # Ограничение Telegram
+
+
+def run_bot():
+    """Запуск Telegram бота"""
+    try:
+        logger.info("Запуск бота...")
+        app = ApplicationBuilder().token(TG_TOKEN).build()
+
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("update", update_db))
+        app.add_handler(CommandHandler("stats", show_stats))
+        app.add_handler(CommandHandler("projects", show_projects))
+
+        logger.info("Бот запущен и готов к работе")
+        app.run_polling()
+
+    except Exception as e:
+        logger.critical(f"Ошибка запуска бота: {str(e)}")
+        raise
+
+
+if __name__ == '__main__':
+    run_bot()
