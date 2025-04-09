@@ -1,0 +1,181 @@
+import os
+import json
+import requests
+from datetime import datetime
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# Настройки
+load_dotenv()
+API_KEY = os.getenv('CRYPTORANK_API_KEY')
+TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
+MAIN_DB = 'main_crypto_db.json'  # Единственная база данных
+
+
+class CryptoDatabase:
+
+    def __init__(self):
+        self.db_file = MAIN_DB
+        self.db = self._load_db()
+
+    def _load_db(self):
+        """Загрузка основной базы"""
+        if not os.path.exists(self.db_file):
+            return {'projects': {}, 'last_update': None}
+
+        with open(self.db_file, 'r') as f:
+            data = json.load(f)
+            # Конвертируем старый формат (если нужно)
+            if isinstance(data, list):
+                return {
+                    'projects': {
+                        p['id']: p
+                        for p in data
+                    },
+                    'last_update': None
+                }
+            return data
+
+    def _save_db(self):
+        """Сохранение базы"""
+        with open(self.db_file, 'w') as f:
+            json.dump(self.db, f, indent=2)
+
+    def get_project_key(self, project):
+        """Уникальный ключ проекта"""
+        return str(project['id'])  # Используем только ID для надежности
+
+    def analyze_new_projects(self, projects):
+        """Анализ новых проектов относительно основной базы"""
+        new_projects = []
+
+        for project in projects:
+            key = self.get_project_key(project)
+
+            if key not in self.db['projects']:
+                project_data = {
+                    'name': project.get('name'),
+                    'symbol': project.get('symbol'),
+                    'url':
+                    f"https://cryptorank.io/price/{project.get('slug')}",
+                    'added': datetime.now().strftime('%Y-%m-%d %H:%M')
+                }
+                self.db['projects'][key] = project_data
+                new_projects.append(project_data)
+
+        if new_projects:
+            self.db['last_update'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+            self._save_db()
+
+        return new_projects
+
+    def get_stats(self):
+        """Статистика базы"""
+        return {
+            'total': len(self.db['projects']),
+            'last_update': self.db.get('last_update', 'никогда')
+        }
+
+
+# Инициализация
+db = CryptoDatabase()
+
+
+# Telegram бот
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Анализатор CryptoRank\n"
+                                    "Команды:\n"
+                                    "/check - Проверить новые проекты\n"
+                                    "/stats - Статистика базы\n"
+                                    "/clean - Очистить базу")
+
+
+async def check_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка новых проектов"""
+    msg = await update.message.reply_text("🔎 Анализирую API...")
+
+    # Получаем все проекты с API
+    all_projects = []
+    offset = 0
+    chunk_size = 100
+
+    while True:
+        params = {
+            'api_key': API_KEY,
+            'limit': chunk_size,
+            'offset': offset,
+            'sort': 'rank'
+        }
+        try:
+            response = requests.get("https://api.cryptorank.io/v1/currencies",
+                                    params=params,
+                                    timeout=15)
+            data = response.json().get('data', [])
+            if not data:
+                break
+
+            all_projects.extend(data)
+            offset += len(data)
+
+            # Обновляем статус
+            await msg.edit_text(f"🔎 Проверено {offset} проектов...")
+
+        except Exception as e:
+            await msg.edit_text(f"⚠️ Ошибка: {str(e)}")
+            return
+
+    # Анализируем новые проекты
+    new_projects = db.analyze_new_projects(all_projects)
+
+    # Формируем отчет
+    stats = db.get_stats()
+    report = (f"📊 Результат проверки:\n"
+              f"• Всего в базе: {stats['total']}\n"
+              f"• Новых найдено: {len(new_projects)}\n"
+              f"• Последнее обновление: {stats['last_update']}\n\n")
+
+    if new_projects:
+        projects_list = "\n".join(f"{i}. {p['name']} - {p['url']}"
+                                  for i, p in enumerate(new_projects[:10], 1))
+        report += f"Последние добавленные:\n{projects_list}"
+
+        if len(new_projects) > 10:
+            report += f"\n\n...и еще {len(new_projects) - 10} проектов"
+    else:
+        report += "🔄 Новых проектов не обнаружено"
+
+    await msg.edit_text(report)
+
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика базы"""
+    stats = db.get_stats()
+    await update.message.reply_text(
+        f"📊 Основная база данных:\n"
+        f"• Всего проектов: {stats['total']}\n"
+        f"• Последнее обновление: {stats['last_update']}\n"
+        f"• Файл: {MAIN_DB}")
+
+
+async def clean_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очистка базы"""
+    db.db = {'projects': {}, 'last_update': None}
+    db._save_db()
+    await update.message.reply_text("✅ База данных очищена")
+
+
+def run_bot():
+    app = ApplicationBuilder().token(TG_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("check", check_new))
+    app.add_handler(CommandHandler("stats", show_stats))
+    app.add_handler(CommandHandler("clean", clean_db))
+
+    print("Бот запущен и использует базу:", MAIN_DB)
+    app.run_polling()
+
+
+if __name__ == '__main__':
+    run_bot()
