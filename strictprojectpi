@@ -1,0 +1,152 @@
+import requests
+import os
+import json
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Загрузка .env
+load_dotenv()
+API_KEY = os.getenv("CRYPTORANK_API_KEY")
+
+# Пути
+DATA_DIR = "data"
+CURRENT_PATH = os.path.join(DATA_DIR, "data_current.json")
+OLD_PATH = os.path.join(DATA_DIR, "data_old.json")
+NEW_PATH = os.path.join(DATA_DIR, "new_latest.json")
+
+last_analysis_summary = ""  # будет использоваться для Telegram
+
+
+# Получение всех проектов с CryptoRank
+def fetch_projects():
+    url = "https://api.cryptorank.io/v1/currencies"
+    all_projects = []
+    limit = 100
+    offset = 0
+
+    while True:
+        params = {"api_key": API_KEY, "limit": limit, "offset": offset}
+        response = requests.get(url, params=params)
+        print(f"📦 Offset: {offset} — Статус: {response.status_code}")
+
+        if response.status_code != 200:
+            break
+
+        data = response.json().get("data", [])
+        if not data:
+            break
+
+        all_projects.extend(data)
+        offset += limit
+
+    print(f"✅ Загружено проектов: {len(all_projects)}")
+    return all_projects
+
+
+# Загрузка JSON из файла с фильтрацией дублей
+def load_data(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+        seen_ids = set()
+        unique = []
+        for item in raw:
+            id_ = item.get("id")
+            if id_ and id_ not in seen_ids:
+                seen_ids.add(id_)
+                unique.append(item)
+        return unique
+
+
+# Сохранение JSON в файл
+def save_data(data, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# Поиск новых проектов по id
+def compare_and_extract_new(current, old):
+    old_ids = {item.get("id") for item in old if item.get("id") is not None}
+    return [
+        item for item in current
+        if item.get("id") not in old_ids and item.get("id") is not None
+    ]
+
+
+# Получение только новых проектов с API + обновление базы
+def get_strictly_new_projects():
+    current = fetch_projects()
+    old = load_data(OLD_PATH)
+    current_count = len(current)
+    old_count = len(old)
+
+    print(f"📁 В базе (старых): {old_count} проектов")
+    print(f"🌐 Загружено с API: {current_count} проектов")
+
+    if not old:
+        save_data(current, OLD_PATH)
+        save_data(current, CURRENT_PATH)
+        print("🆕 old_data.json был пуст — инициализирован текущими данными.")
+        return [], "🆕 База инициализирована текущими данными (старых не было)"
+
+    new_projects = compare_and_extract_new(current, old)
+    new_count = len(new_projects)
+    print(f"🆕 Найдено новых проектов: {new_count}")
+
+    if new_count > 0:
+        save_data(new_projects, NEW_PATH)
+        save_data(current, CURRENT_PATH)
+        print(f"📝 Новые проекты сохранены в {NEW_PATH} (полные данные)")
+    else:
+        print("📭 Новых проектов нет, файл не обновлялся")
+
+    summary = (f"📁 Было в базе: {old_count}\n"
+               f"🌐 Сейчас в API: {current_count}\n"
+               f"🆕 Найдено новых: {new_count}")
+
+    return new_projects, summary
+
+
+# Анализ — только по существующим локальным файлам, без API
+def analyze_and_report():
+    old = load_data(OLD_PATH)
+    old_count = len(old)
+
+    current = load_data(CURRENT_PATH)
+    current_count = len(current)
+
+    if not old:
+        print("⚠️ old_data.json пуст — сравнение невозможно.")
+        return 0, current_count, 0
+
+    new_projects = compare_and_extract_new(current, old)
+    new_count = len(new_projects)
+
+    print(f"📁 В базе: {old_count} проектов.")
+    print(f"📂 В data_current.json: {current_count} проектов.")
+    print(f"🆕 Новых проектов: {new_count}")
+
+    return old_count, current_count, new_count
+
+
+# Сохраняем только полезную инфу
+def save_new_projects(new_data):
+    simplified_data = [{
+        "name":
+        item.get("name"),
+        "cryptorank_url":
+        f"https://cryptorank.io/price/{item.get('slug', '')}",
+        "website":
+        item.get("links", {}).get("website", [None])[0]
+        if item.get("links") else None
+    } for item in new_data]
+    save_data(simplified_data, NEW_PATH)
+    print(f"📝 Новые проекты сохранены в {NEW_PATH} (только ссылки)")
+
+
+# Обновляем базу после подтверждения
+def save_seen_ids(new_data):
+    full_data = load_data(CURRENT_PATH)
+    save_data(full_data, OLD_PATH)
+    print("✅ old_data.json обновлён для следующего сравнения")
