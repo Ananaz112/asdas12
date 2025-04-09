@@ -1,0 +1,206 @@
+import os
+import json
+import requests
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# Настройка логгирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(),
+              logging.FileHandler('crypto_bot.log')])
+logger = logging.getLogger(__name__)
+
+# Загрузка конфигурации
+load_dotenv()
+API_KEY = os.getenv('CRYPTORANK_API_KEY')
+TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
+MAIN_DB = 'crypto_projects_db.json'
+BASE_URL = 'https://api.cryptorank.io/v1'
+
+
+class CryptoDatabase:
+
+    def __init__(self):
+        self.db_file = MAIN_DB
+        self.db = self._load_db()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Accept': 'application/json',
+            'User-Agent': 'CryptoDataCollector/1.0'
+        })
+
+    def _load_db(self):
+        if not os.path.exists(self.db_file):
+            base_structure = {
+                'projects': {},
+                'metadata': {
+                    'last_update': None,
+                    'total_projects': 0,
+                    'api_credits_used': 0
+                }
+            }
+            with open(self.db_file, 'w') as f:
+                json.dump(base_structure, f)
+            return base_structure
+
+        with open(self.db_file, 'r') as f:
+            return json.load(f)
+
+    def _save_db(self):
+        with open(self.db_file, 'w') as f:
+            json.dump(self.db, f, indent=2)
+
+    def fetch_all_currencies(self):
+        """Получение всех криптовалют с пагинацией"""
+        all_currencies = []
+        offset = 0
+        limit = 100  # Максимальный лимит для одного запроса
+
+        while True:
+            try:
+                params = {
+                    'api_key': API_KEY,
+                    'limit': limit,
+                    'offset': offset,
+                    'sort': 'rank'
+                }
+
+                response = self.session.get(f"{BASE_URL}/currencies",
+                                            params=params,
+                                            timeout=30)
+
+                if response.status_code != 200:
+                    logger.error(
+                        f"API Error: {response.status_code} - {response.text}")
+                    break
+
+                data = response.json().get('data', [])
+                if not data:
+                    break
+
+                all_currencies.extend(data)
+                offset += len(data)
+
+                # Логирование прогресса
+                logger.info(f"Fetched {len(data)} currencies. Total: {offset}")
+
+                # Обновление статистики API
+                self.db['metadata']['api_credits_used'] += 1
+
+            except Exception as e:
+                logger.error(f"Fetch error: {str(e)}")
+                break
+
+        return all_currencies
+
+    def update_database(self):
+        """Основной метод обновления базы данных"""
+        logger.info("Starting database update")
+
+        try:
+            currencies = self.fetch_all_currencies()
+            new_count = 0
+
+            for currency in currencies:
+                currency_id = str(currency['id'])
+
+                if currency_id not in self.db['projects']:
+                    self.db['projects'][currency_id] = {
+                        'name': currency.get('name'),
+                        'symbol': currency.get('symbol'),
+                        'rank': currency.get('rank'),
+                        'price': currency.get('priceUsd'),
+                        'marketCap': currency.get('marketCap'),
+                        'volume': currency.get('volume24h'),
+                        'change24h': currency.get('percentChange24h'),
+                        'firstSeen': datetime.now().isoformat(),
+                        'lastUpdated': datetime.now().isoformat()
+                    }
+                    new_count += 1
+                else:
+                    # Обновляем существующие данные
+                    self.db['projects'][currency_id].update({
+                        'price':
+                        currency.get('priceUsd'),
+                        'marketCap':
+                        currency.get('marketCap'),
+                        'volume':
+                        currency.get('volume24h'),
+                        'change24h':
+                        currency.get('percentChange24h'),
+                        'lastUpdated':
+                        datetime.now().isoformat()
+                    })
+
+            # Обновляем метаданные
+            self.db['metadata'] = {
+                'last_update': datetime.now().isoformat(),
+                'total_projects': len(self.db['projects']),
+                'api_credits_used': self.db['metadata']['api_credits_used'],
+                'new_projects': new_count
+            }
+
+            self._save_db()
+            logger.info(f"Database updated. New projects: {new_count}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Update failed: {str(e)}")
+            return False
+
+
+# Telegram Bot Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛠️ Crypto Data Collector Bot\n\n"
+        "Available commands:\n"
+        "/update - Update cryptocurrency database\n"
+        "/stats - Show database statistics\n"
+        "/get [symbol] - Get currency details")
+
+
+async def update_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔄 Updating database...")
+    db = CryptoDatabase()
+
+    if db.update_database():
+        stats = db.db['metadata']
+        await msg.edit_text(
+            f"✅ Database updated\n\n"
+            f"• Total currencies: {stats['total_projects']}\n"
+            f"• New added: {stats['new_projects']}\n"
+            f"• API credits used: {stats['api_credits_used']}\n"
+            f"• Last update: {stats['last_update']}")
+    else:
+        await msg.edit_text("❌ Failed to update database")
+
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = CryptoDatabase()
+    stats = db.db['metadata']
+
+    await update.message.reply_text(
+        f"📊 Database Statistics\n\n"
+        f"• Total currencies: {stats['total_projects']}\n"
+        f"• API credits used: {stats['api_credits_used']}\n"
+        f"• Last update: {stats['last_update'] or 'Never'}")
+
+
+def run_bot():
+    app = ApplicationBuilder().token(TG_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("update", update_database))
+    app.add_handler(CommandHandler("stats", show_stats))
+
+    logger.info("Bot started")
+    app.run_polling()
+
+
+if __name__ == '__main__':
+    run_bot()
