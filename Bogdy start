@@ -1,0 +1,80 @@
+import os
+import json
+import time
+import logging
+import asyncio
+from datetime import datetime, timedelta
+from functools import lru_cache
+from typing import Optional
+
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler
+from tradingview_ta import TA_Handler
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Конфигурация
+API_KEY
+BOT_TOKEN 
+STABLECOINS = {'USDT', 'USDC', 'DAI', 'BUSD', 'TUSD', 'USDP', 'USDN', 'USDY', 'XAUt', 'PAXG'}
+EXCHANGES = ["BINANCE", "BYBIT", "KUCOIN", "OKX", "MEXC", "GATEIO", "HUOBI", "BITGET"]
+REQUEST_DELAY = 0.5
+TOP_COINS_LIMIT = 900  # Увеличено до 900
+CACHE_FILE = "rsi_cache.json"
+CACHE_EXPIRE_HOURS = 24
+FEAR_GREED_API = "https://api.alternative.me/fng/"
+LIQUIDITY_THRESHOLD = 0.1
+MAX_REQUESTS_PER_MINUTE = 30
+VOLUME_SPIKE_THRESHOLD = 5.0  # Порог для /top_spikes
+MEME_SPIKE_THRESHOLD = 4.0    # Порог для мемкоинов
+REQUEST_INTERVAL = 2.1
+
+# Список мемкоинов
+MEME_COINS = {
+    'DOGE', 'BABYDOGE', 'NEIRO', 'WIF', 'SAMO', 'MYRO', 'STNK', 'SHIB', 'SUNDOG', 
+    'BONK', 'BOME', 'FLOKI', 'MEW', 'HIPPO', 'SUNCAT', 'PNUT', 'CHEEMS', 'GROK', 
+    'MEMEFI', 'CHILLGUY', 'TURBO', 'WHY', 'MOG', 'SLERF', 'PEPE', 'GIGA', 'GOAT', 
+    'KOMA', 'DOG', 'WEN', 'PONKE', 'ZEREBRO', 'SPX', 'MOODENG', 'APU', 'PEPU', 
+    'LADYS', 'ELON', 'TRUMP', 'MELANIA', 'KIKI', 'MICHI', 'SNEK', 'POPCAT', 
+    'PENGU', 'VINU', 'TOSHI', 'BENJI', 'MIGGLES', 'BRETT', 'MAJOR', 'BONE', 
+    'AIDOGE', 'COQ', '1CAT', 'SILLY', 'TST', 'BAN', 'MUBARAK', 'DEGEN', 'FWOG',
+    'TUT', 'GME', 'WOJAK', 'BOBO', 'LUCE'
+}
+
+request_timestamps = []
+
+# --- Вспомогательные функции ---
+def rate_limiter():
+    """Улучшенный ограничитель запросов с учетом API CoinMarketCap"""
+    now = time.time()
+    global request_timestamps
+    
+    request_timestamps = [t for t in request_timestamps if now - t < 60]
+    
+    if len(request_timestamps) >= MAX_REQUESTS_PER_MINUTE:
+        sleep_time = 60 - (now - request_timestamps[0]) + 0.1
+        logger.warning(f"Rate limit reached. Sleeping for {sleep_time:.1f} seconds")
+        time.sleep(sleep_time)
+        now = time.time()
+        request_timestamps = [t for t in request_timestamps if now - t < 60]
+    
+    request_timestamps.append(now)
+    time.sleep(REQUEST_INTERVAL)
+
+def format_price(price):
+    """Умное форматирование цены"""
+    if price is None:
+        return "N/A"
+    try:
+        price = float(price)
+        if price < 0.01:
+            return f"{price:.6f}".rstrip('0').rstrip('.')
+        return f"{price:,.2f}"
+    except (TypeError, ValueError):
+        return "N/A"
