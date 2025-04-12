@@ -1,0 +1,94 @@
+import os
+import json
+import requests
+import time
+from datetime import datetime
+from dotenv import load_dotenv
+from telegram import Update, InputFile
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# Загрузка переменных
+load_dotenv()
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
+API_KEY = os.getenv("CRYPTORANK_API_KEY")
+
+BASE_URL = "https://api.cryptorank.io/v2/currencies"
+HEADERS = {"X-Api-Key": API_KEY}
+LIMIT = 100  # Уменьшили лимит до 50, чтобы снизить нагрузку
+OUTPUT_FILE = "cryptorank_all_projects.json"
+
+
+# Получение всех проектов с базовыми ссылками (уникальные URL)
+def fetch_all_projects():
+    offset = 0
+    all_projects = {}
+
+    while True:
+        params = {"limit": LIMIT, "skip": offset}
+        try:
+            response = requests.get(BASE_URL,
+                                    headers=HEADERS,
+                                    params=params,
+                                    timeout=15)
+        except Exception as e:
+            print(f"Ошибка запроса: {e}")
+            time.sleep(2)
+            continue
+
+        if response.status_code != 200:
+            print(f"Ошибка: {response.status_code}, задержка и повтор...")
+            time.sleep(3)
+            continue
+
+        data = response.json().get("data", [])
+        if not data:
+            break
+
+        for item in data:
+            slug = item.get("key")
+            name = item.get("name")
+            if slug and name:
+                url = f"https://cryptorank.io/price/{slug}"
+                all_projects[url] = name  # Уникальность по URL
+
+        offset += len(data)
+        print(f"Загружено {len(data)} проектов, всего: {len(all_projects)}")
+        time.sleep(1.2)
+
+        if len(data) < LIMIT:
+            break
+
+    # Сортировка и преобразование в список словарей
+    project_list = sorted([{
+        "name": name,
+        "url": url
+    } for url, name in all_projects.items()],
+                          key=lambda x: x["name"].lower())
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(project_list, f, ensure_ascii=False, indent=2)
+
+    return OUTPUT_FILE
+
+
+# Хендлер для Telegram
+async def handle_allprojects(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⏳ Получаю список всех проектов с CryptoRank (без дублей, частями по 100)..."
+    )
+    file_path = fetch_all_projects()
+    await update.message.reply_document(InputFile(file_path),
+                                        filename=os.path.basename(file_path))
+
+
+# Запуск бота
+def run_bot():
+    app = ApplicationBuilder().token(TG_TOKEN).build()
+    app.add_handler(CommandHandler("allprojects", handle_allprojects))
+    print("🤖 Бот готов. Используй команду /allprojects")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    run_bot()
