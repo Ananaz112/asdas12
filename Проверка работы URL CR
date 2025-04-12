@@ -1,0 +1,83 @@
+import os
+import requests
+import re
+from urllib.parse import urljoin
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+# Загрузка .env
+load_dotenv()
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+BASE_URL = "https://cryptorank.io"
+URL_PATTERNS = [
+    "/price/{slug}", "/ico/{slug}", "/price/{slug}/vesting",
+    "/price/{slug}/historical-data", "/price/{slug}/exchanges"
+]
+
+
+def extract_slug(text: str) -> str:
+    """Извлекает slug из полной ссылки или просто возвращает текст"""
+    match = re.search(r"cryptorank.io/(?:price|ico)/([^/\s]+)", text)
+    return match.group(1).lower() if match else text.strip().lower()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Отправь мне slug проекта на CryptoRank (например: redstone) или ссылку на проект, и я проверю все его страницы."
+    )
+
+
+async def handle_slug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    slug = extract_slug(update.message.text)
+    available, unavailable = await check_project_urls(slug)
+
+    text = f"\n✅ Доступные страницы для '{slug}':\n"
+    if available:
+        text += "\n" + "\n".join(available)
+    else:
+        text += "нет доступных страниц"
+
+    text += f"\n\n❌ Недоступные или несуществующие:\n"
+    if unavailable:
+        text += "\n" + "\n".join(f"{url} — {reason}"
+                                 for url, reason in unavailable)
+    else:
+        text += "все страницы найдены"
+
+    await update.message.reply_text(text[:4000])
+
+
+async def check_project_urls(slug):
+    available_urls = []
+    unavailable_urls = []
+
+    for pattern in URL_PATTERNS:
+        relative_path = pattern.format(slug=slug)
+        full_url = urljoin(BASE_URL, relative_path)
+        try:
+            response = requests.head(full_url, timeout=10)
+            if response.status_code == 200:
+                available_urls.append(full_url)
+            else:
+                unavailable_urls.append((full_url, f"{response.status_code}"))
+        except Exception as e:
+            unavailable_urls.append((full_url, str(e)))
+
+    return available_urls, unavailable_urls
+
+
+def run_bot():
+    app = ApplicationBuilder().token(TG_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_slug))
+
+    print("🤖 Бот запущен и готов к работе")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    run_bot()
