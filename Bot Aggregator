@@ -1,0 +1,396 @@
+import os
+import sqlite3
+import telebot  # библиотека pyTelegramBotAPI для работы с Bot API Telegram
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+print(f"Токен из .env: {TOKEN}")  # временно для отладки
+
+if not TOKEN:
+    raise ValueError(
+        "❌ Не найден TELEGRAM_BOT_TOKEN. Убедитесь, что он задан в .env файле."
+    )
+
+# --- Конфигурация и инициализация ---
+TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN")  # Токен Bot API, полученный от @BotFather
+if not TOKEN:
+    TOKEN = "YOUR_BOT_TOKEN_HERE"  # заглушка на случай отсутствия токена (замените на реальный)
+
+bot = telebot.TeleBot(
+    TOKEN, parse_mode='HTML'
+)  # Инициализация бота (используем HTML-разметку сообщений)
+
+# Подключение к базе данных (SQLite для примера; в продакшене можно использовать PostgreSQL)
+db = sqlite3.connect("bot_aggregator.db", check_same_thread=False)
+cur = db.cursor()
+
+# Создание необходимых таблиц (Users, Bots, Categories) при их отсутствии
+cur.execute("""
+CREATE TABLE IF NOT EXISTS Users (
+    id            INTEGER PRIMARY KEY,
+    username      TEXT,
+    first_name    TEXT,
+    invite_code   TEXT UNIQUE,
+    invited_by    INTEGER,
+    referrals_count INTEGER DEFAULT 0,
+    access_unlocked INTEGER DEFAULT 0
+);
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS Bots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT,
+    username    TEXT,
+    description TEXT,
+    category    TEXT,
+    added_by    INTEGER,
+    approved    INTEGER DEFAULT 1
+);
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS Categories (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE
+);
+""")
+db.commit()
+
+
+# Вспомогательная функция для получения или создания пользователя в БД
+def get_user(user_id, username, first_name, ref_code=None):
+    """
+    Извлекает пользователя по ID из БД. Если не существует - создаёт новую запись.
+    Если указан ref_code (пользователь пришёл по чьей-то реферальной ссылке),
+    то устанавливает invited_by и обновляет счётчик рефералов пригласившего.
+    """
+    cur.execute(
+        "SELECT id, access_unlocked, invite_code FROM Users WHERE id = ?",
+        (user_id, ))
+    row = cur.fetchone()
+    if row:
+        # Пользователь уже существует
+        return row
+    # Пользователь новый: создаём запись
+    invite_code = generate_invite_code(
+    )  # генерируем уникальный код приглашения
+    invited_by = None
+    # Если новый пользователь запустил бота по реферальной ссылке (есть ref_code)
+    if ref_code:
+        # Найти пригласившего пользователя по его invite_code
+        cur.execute("SELECT id FROM Users WHERE invite_code = ?", (ref_code, ))
+        inviter = cur.fetchone()
+        if inviter:
+            invited_by = inviter[0]
+            # Увеличить счётчик рефералов у пригласившего
+            cur.execute(
+                "UPDATE Users SET referrals_count = referrals_count + 1 WHERE id = ?",
+                (inviter[0], ))
+            # Проверить количество приглашённых; если >=1 и доступ ещё не разблокирован, разблокировать
+            cur.execute(
+                "SELECT referrals_count, access_unlocked FROM Users WHERE id = ?",
+                (inviter[0], ))
+            ref_count, unlocked = cur.fetchone()
+            if ref_count >= 1 and unlocked == 0:
+                cur.execute(
+                    "UPDATE Users SET access_unlocked = 1 WHERE id = ?",
+                    (inviter[0], ))
+    # Вставить нового пользователя
+    cur.execute(
+        "INSERT INTO Users (id, username, first_name, invite_code, invited_by, access_unlocked) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, username, first_name, invite_code, invited_by, 0))
+    db.commit()
+    return (user_id, 0, invite_code)
+
+
+# Функция генерации уникального кода приглашения
+import string, random
+
+
+def generate_invite_code(length=8):
+    """Генерирует случайный буквенно-цифровой код, используемый для приглашения друзей."""
+    while True:
+        code = ''.join(
+            random.choices(string.ascii_letters + string.digits, k=length))
+        cur.execute("SELECT id FROM Users WHERE invite_code = ?", (code, ))
+        if not cur.fetchone():
+            return code
+
+
+# --- Обработчики команд и сообщений ---
+
+
+# Обработчик команды /start
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    """
+    Обработчик /start: приветствует пользователя, обрабатывает реферальный код (если есть)
+    и даёт инструкции в зависимости от того, разблокирован ли доступ у пользователя.
+    """
+    # Извлечь реферальный код из параметра (если передан)
+    parts = message.text.split()
+    ref_code = parts[1] if len(parts) > 1 else None
+
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    first_name = message.from_user.first_name or ""
+    # Получить или создать пользователя в базе данных
+    user_id, access_unlocked, invite_code = get_user(user_id, username,
+                                                     first_name, ref_code)
+
+    if access_unlocked:
+        # Пользователь уже имеет доступ
+        bot.reply_to(
+            message,
+            f"🤖 С возвращением, {first_name}! Доступ к каталогу ботов у вас уже открыт. Вы можете использовать /search для поиска ботов или /addbot, чтобы добавить свой."
+        )
+    else:
+        # Пользователь новый или ещё не выполнил условие доступа
+        welcome_text = (
+            f"👋 Привет, {first_name}! Добро пожаловать в агрегатор ботов.\n"
+            "Чтобы получить полный доступ к каталогу, необходимо:\n"
+            "🔗 Пригласить друга воспользоваться этим ботом **или**\n"
+            "➕ Добавить своего бота в каталог.\n\n"
+            "После выполнения одного из этих условий вы разблокируете функции поиска и просмотра."
+        )
+        # Отправить приветствие и инструкции
+        bot.reply_to(message, welcome_text)
+        # Предложить кнопки "Пригласить друга" и "Добавить бота"
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True,
+                                                   one_time_keyboard=True)
+        btn1 = telebot.types.KeyboardButton("🔥 Пригласить друга")
+        btn2 = telebot.types.KeyboardButton("➕ Добавить бота")
+        markup.row(btn1, btn2)
+        bot.send_message(message.chat.id,
+                         "Выберите действие для получения доступа:",
+                         reply_markup=markup)
+
+
+# Обработчик выбора пункта меню (нажатия кнопок "Пригласить друга" или "Добавить бота")
+@bot.message_handler(
+    func=lambda msg: msg.text in ["🔥 Пригласить друга", "➕ Добавить бота"])
+def handle_menu_selection(message):
+    user_id = message.from_user.id
+    cur.execute("SELECT access_unlocked, invite_code FROM Users WHERE id = ?",
+                (user_id, ))
+    user = cur.fetchone()
+    if not user:
+        # Пользователь не найден (случай, если не вызывал /start)
+        bot.reply_to(
+            message, "Пожалуйста, отправьте команду /start для начала работы.")
+        return
+    access_unlocked, invite_code = user
+    if access_unlocked:
+        # Если доступ уже открыт, меню должно быть другим (но обработаем на всякий случай)
+        bot.reply_to(
+            message,
+            "У вас уже открыт доступ к каталогу! Можете использовать /search для поиска ботов."
+        )
+        return
+    if message.text == "🔥 Пригласить друга":
+        # Сгенерировать и отправить реферальную ссылку
+        bot_username = bot.get_me(
+        ).username  # имя пользователя (юзернейм) нашего бота
+        invite_link = f"https://t.me/{bot_username}?start={invite_code}"
+        bot.send_message(
+            message.chat.id,
+            f"📨 Отправьте эту ссылку другу, чтобы пригласить его:\n{invite_link}\n"
+            "Когда ваш друг запустит бота по этой ссылке, вы получите доступ к каталогу!"
+        )
+    elif message.text == "➕ Добавить бота":
+        # Запустить сценарий добавления бота
+        if access_unlocked:
+            bot.reply_to(message, "У вас уже есть доступ к каталогу.")
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Хорошо, давайте добавим вашего бота в каталог.\nДля начала отправьте @username вашего бота:"
+            )
+            bot.register_next_step_handler(message, process_newbot_username)
+
+
+# Шаг 1: обработка имени пользователя бота
+def process_newbot_username(message):
+    user_id = message.from_user.id
+    bot_username = message.text.strip()
+    if not bot_username.startswith("@"):
+        bot.send_message(
+            message.chat.id,
+            "❌ Имя пользователя бота должно начинаться с @. Попробуйте ещё раз:"
+        )
+        bot.register_next_step_handler(message, process_newbot_username)
+        return
+    # Сохраняем username временно (например, в словаре)
+    new_bot_data[user_id] = {"username": bot_username.lstrip("@")}
+    bot.send_message(
+        message.chat.id,
+        "Отлично. Теперь отправьте краткое описание вашего бота:")
+    bot.register_next_step_handler(message, process_newbot_description)
+
+
+# Временное хранилище данных добавляемого бота
+new_bot_data = {}
+
+
+# Шаг 2: обработка описания бота
+def process_newbot_description(message):
+    user_id = message.from_user.id
+    desc = message.text.strip()
+    new_bot_data[user_id]["description"] = desc
+    # Запрос категории
+    cur.execute("SELECT name FROM Categories")
+    cats = [row[0] for row in cur.fetchall()]
+    if cats:
+        bot.send_message(
+            message.chat.id, "Укажите категорию вашего бота.\n"
+            f"Доступные категории: {', '.join(cats)}\n"
+            "(Можете ввести новую категорию, если подходящей нет в списке.)")
+    else:
+        bot.send_message(message.chat.id, "Укажите категорию вашего бота:")
+    bot.register_next_step_handler(message, process_newbot_category)
+
+
+# Шаг 3: обработка категории бота
+def process_newbot_category(message):
+    user_id = message.from_user.id
+    category = message.text.strip()
+    new_bot_data[user_id]["category"] = category
+    # Сохранить категорию в таблицу Categories, если её ещё нет
+    cur.execute("INSERT OR IGNORE INTO Categories (name) VALUES (?)",
+                (category, ))
+    # Теперь добавить нового бота в таблицу Bots
+    bot_info = new_bot_data[user_id]
+    cur.execute(
+        "INSERT INTO Bots (name, username, description, category, added_by) VALUES (?, ?, ?, ?, ?)",
+        (bot_info["username"], bot_info["username"], bot_info["description"],
+         bot_info["category"], user_id))
+    db.commit()
+    # Разблокировать доступ пользователю (так как он добавил бота)
+    cur.execute("UPDATE Users SET access_unlocked = 1 WHERE id = ?",
+                (user_id, ))
+    db.commit()
+    # Подтверждение пользователю
+    bot.send_message(
+        message.chat.id,
+        f"✅ Ваш бот @{bot_info['username']} добавлен в каталог в категорию '{bot_info['category']}'.\n"
+        "Спасибо за вклад! Теперь у вас полный доступ к каталогу ботов. 🎉")
+    bot.send_message(
+        message.chat.id,
+        "Теперь вы можете использовать /search для поиска других ботов или поделиться этим ботом с друзьями."
+    )
+    # Очистить временные данные
+    new_bot_data.pop(user_id, None)
+
+
+# Обработчик команды /search
+@bot.message_handler(commands=['search'])
+def handle_search(message):
+    """
+    Обработчик /search <ключевые слова>: ищет ботов в базе по имени или описанию.
+    Доступен только для пользователей с разблокированным доступом.
+    """
+    user_id = message.from_user.id
+    # Проверка доступа
+    cur.execute("SELECT access_unlocked FROM Users WHERE id = ?", (user_id, ))
+    row = cur.fetchone()
+    if not row or row[0] == 0:
+        bot.reply_to(
+            message,
+            "🔒 Сначала необходимо получить доступ, пригласив друга или добавив бота."
+        )
+        return
+    # Разбор поискового запроса
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(
+            message,
+            "Использование: /search <слова для поиска>\nНапример: /search музыка"
+        )
+        return
+    query = parts[1].strip().lower()
+    # Запрос к таблице Bots: ищем совпадения по имени или описанию (без учёта регистра)
+    cur.execute(
+        "SELECT name, username, description, category FROM Bots WHERE (name LIKE ? OR description LIKE ?) AND approved = 1",
+        (f"%{query}%", f"%{query}%"))
+    results = cur.fetchall()
+    if not results:
+        bot.send_message(
+            message.chat.id,
+            "🤔 Ничего не найдено по вашему запросу. Попробуйте другие ключевые слова."
+        )
+    else:
+        # Формирование ответа с результатами
+        lines = ["🔍 <b>Результаты поиска:</b>"]
+        for name, username, description, category in results:
+            lines.append(
+                f"• <b>{name}</b> (@{username}) – {description} [<i>{category}</i>]"
+            )
+        bot.send_message(message.chat.id, "\n".join(lines))
+
+
+# (Необязательно) Обработчик команды /categories для вывода списка категорий
+@bot.message_handler(commands=['categories'])
+def handle_list_categories(message):
+    """
+    Обработчик /categories: выводит список всех категорий и позволяет просматривать ботов по категориям (если доступ открыт).
+    """
+    user_id = message.from_user.id
+    cur.execute("SELECT access_unlocked FROM Users WHERE id = ?", (user_id, ))
+    row = cur.fetchone()
+    if not row or row[0] == 0:
+        bot.reply_to(
+            message,
+            "🔒 Сначала разблокируйте доступ, пригласив друга или добавив бота."
+        )
+        return
+    cur.execute("SELECT name FROM Categories ORDER BY name")
+    cats = [row[0] for row in cur.fetchall()]
+    if not cats:
+        bot.reply_to(message, "Категории ещё не созданы.")
+    else:
+        cat_list = "📂 <b>Доступные категории:</b>\n" + "\n".join(
+            [f"• {c}" for c in cats])
+        bot.send_message(
+            message.chat.id, cat_list +
+            "\nВведите /browse <Название категории>, чтобы увидеть ботов в этой категории."
+        )
+
+
+@bot.message_handler(commands=['browse'])
+def handle_browse_category(message):
+    """
+    Обработчик /browse <Категория>: выводит список ботов в указанной категории (при открытом доступе).
+    """
+    user_id = message.from_user.id
+    cur.execute("SELECT access_unlocked FROM Users WHERE id = ?", (user_id, ))
+    row = cur.fetchone()
+    if not row or row[0] == 0:
+        bot.reply_to(message,
+                     "🔒 Разблокируйте доступ, чтобы просматривать категории.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "Использование: /browse <Категория>\nНапример: /browse Games")
+        return
+    category = parts[1].strip()
+    cur.execute(
+        "SELECT name, username, description FROM Bots WHERE category = ? AND approved = 1",
+        (category, ))
+    bots = cur.fetchall()
+    if not bots:
+        bot.send_message(message.chat.id,
+                         f"В категории '{category}' пока нет ботов.")
+    else:
+        lines = [f"📂 <b>Боты в категории '{category}':</b>"]
+        for name, username, description in bots:
+            lines.append(f"• <b>{name}</b> (@{username}) – {description}")
+        bot.send_message(message.chat.id, "\n".join(lines))
+
+
+# Запуск длительного опроса Telegram на новые сообщения (бот начинает работу)
+print("Бот запущен... Нажмите Ctrl+C для остановки.")
+bot.polling(none_stop=True)
