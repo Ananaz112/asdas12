@@ -1,0 +1,132 @@
+import requests
+from bs4 import BeautifulSoup
+import re
+from urllib.parse import quote
+import csv
+from time import sleep
+
+
+def get_social_links(url):
+    """Извлекает все социальные ссылки со страницы"""
+    try:
+        headers = {
+            'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        social_links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href'].lower()
+            if 'linkedin.com/company' in href:
+                if not href.startswith('http'):
+                    href = f"https://www.linkedin.com{href}"
+                social_links.append(href)
+
+        return list(set(social_links))
+
+    except Exception as e:
+        print(f"  [!] Ошибка парсинга {url}: {str(e)}")
+        return []
+
+
+def search_google(company_name):
+    """Поиск через Google (имитация)"""
+    try:
+        search_query = f"{company_name} site:linkedin.com/company"
+        google_url = f"https://www.google.com/search?q={quote(search_query)}"
+
+        headers = {
+            'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(google_url, headers=headers, timeout=15)
+
+        linkedin_links = re.findall(
+            r'https?://[a-z]+\.linkedin\.com/company/[^\s"\'>]+',
+            response.text)
+        return linkedin_links[0] if linkedin_links else None
+
+    except Exception as e:
+        print(f"  [!] Ошибка Google: {e}")
+        return None
+
+
+def find_linkedin(company_name, website_url, cryptorank_url):
+    """Поиск LinkedIn с расширенными источниками"""
+    print(f"\n🔍 Поиск LinkedIn для {company_name}")
+
+    # 1. Проверка официального сайта
+    print("  [1] Проверка официального сайта...")
+    website_links = get_social_links(website_url)
+    if website_links:
+        print(f"  [+] Найден на сайте: {website_links[0]}")
+        return website_links[0]
+
+    # 2. Проверка Cryptorank
+    print("  [2] Проверка Cryptorank...")
+    cryptorank_links = get_social_links(cryptorank_url)
+    if cryptorank_links:
+        print(f"  [+] Найден на Cryptorank: {cryptorank_links[0]}")
+        return cryptorank_links[0]
+
+    # 3. Поиск через Google
+    print("  [3] Поиск через Google...")
+    google_result = search_google(company_name)
+    if google_result:
+        print(f"  [+] Найден через Google: {google_result}")
+        return google_result
+
+    # 4. Проверка альтернативных вариантов названия
+    alt_names = [
+        company_name.split('(')[0].strip(),
+        company_name.split()[0],
+        re.sub(r'[^\w\s]', '', company_name)
+    ]
+
+    for name in set(alt_names):
+        if name != company_name:
+            print(f"  [4] Проверка альтернативного названия: {name}")
+            google_result = search_google(name)
+            if google_result:
+                print(
+                    f"  [+] Найден по альтернативному названию: {google_result}"
+                )
+                return google_result
+
+    print("  [-] LinkedIn не найден")
+    return "Not Found"
+
+
+def process_file(input_file, output_file):
+    """Обрабатывает файл и сохраняет результаты"""
+    with open(input_file, 'r', encoding='utf-8') as infile, \
+         open(output_file, 'w', encoding='utf-8', newline='') as outfile:
+
+        reader = csv.reader(infile, delimiter='\t')
+        writer = csv.writer(outfile, delimiter='\t')
+
+        writer.writerow(['Company Name', 'Website', 'Cryptorank', 'LinkedIn'])
+
+        for row in reader:
+            if len(row) < 3:
+                continue
+
+            company = row[0].strip()
+            website = row[1].strip()
+            cryptorank = row[2].strip()
+
+            linkedin = find_linkedin(company, website, cryptorank)
+            writer.writerow([company, website, cryptorank, linkedin])
+
+            sleep(1)  # Защита от блокировки
+
+
+if __name__ == "__main__":
+    input_file = "companies.txt"
+    output_file = "companies_with_linkedin.tsv"
+
+    print("🚀 Начал обработку компаний...")
+    process_file(input_file, output_file)
+    print(f"\n✅ Готово! Результаты в {output_file}")
