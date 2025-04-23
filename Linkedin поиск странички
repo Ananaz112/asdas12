@@ -1,0 +1,104 @@
+import requests
+from bs4 import BeautifulSoup
+import re
+
+
+def get_social_links(url):
+    """Извлекает все социальные ссылки со страницы"""
+    try:
+        headers = {
+            'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        social_links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href'].lower()
+            if any(social in href for social in
+                   ['linkedin', 'twitter', 'facebook', 'telegram', 'github']):
+                social_links.append(a['href'])
+
+        return social_links
+
+    except Exception as e:
+        print(f"[!] Ошибка при парсинге {url}: {str(e)}")
+        return []
+
+
+def find_linkedin_company(name):
+    """Пытается найти LinkedIn компании разными способами"""
+    # Варианты для поиска
+    search_urls = [
+        f"https://www.google.com/search?q={name}+site%3Alinkedin.com%2Fcompany",
+        f"https://www.bing.com/search?q={name}+site%3Alinkedin.com%2Fcompany"
+    ]
+
+    # Проверяем основные URL компании
+    company_urls = [
+        "https://w-chain.com/", "https://cryptorank.io/price/w-chain"
+    ]
+
+    print(f"[*] Поиск LinkedIn для {name}...")
+
+    # 1. Проверяем официальные сайты
+    print("[1] Проверка официальных сайтов компании...")
+    for url in company_urls:
+        links = get_social_links(url)
+        for link in links:
+            if 'linkedin.com/company' in link.lower():
+                print(f"[+] Найден LinkedIn на {url}: {link}")
+                return link
+
+    # 2. Проверяем поисковики (имитируем браузер)
+    print("[2] Поиск через поисковые системы...")
+    for search_url in search_urls:
+        try:
+            headers = {
+                'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            response = requests.get(search_url, headers=headers, timeout=10)
+
+            # Ищем ссылки на LinkedIn в результатах
+            linkedin_links = re.findall(
+                r'https?://[a-z]+\.linkedin\.com/company/[^\s"\'>]+',
+                response.text)
+            if linkedin_links:
+                print(f"[+] Найден LinkedIn через поиск: {linkedin_links[0]}")
+                return linkedin_links[0]
+
+        except Exception as e:
+            print(f"[!] Ошибка при поиске через {search_url}: {str(e)}")
+
+    # 3. Альтернативные методы
+    print("[3] Проверка альтернативных источников...")
+    alternative_sources = [
+        "https://crunchbase.com", "https://www.cbinsights.com",
+        "https://angel.co"
+    ]
+
+    for source in alternative_sources:
+        try:
+            search_url = f"{source}/search?query={name}"
+            links = get_social_links(search_url)
+            for link in links:
+                if 'linkedin.com/company' in link.lower():
+                    print(f"[+] Найден LinkedIn через {source}: {link}")
+                    return link
+        except:
+            continue
+
+    print("[-] LinkedIn компании не найден")
+    return None
+
+
+if __name__ == "__main__":
+    company_name = "W Chain"
+    linkedin_url = find_linkedin_company(company_name)
+
+    if linkedin_url:
+        print(f"\n[✓] Окончательная ссылка на LinkedIn: {linkedin_url}")
+    else:
+        print("\n[✗] Не удалось найти LinkedIn компании")
