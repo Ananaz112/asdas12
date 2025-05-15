@@ -1,0 +1,167 @@
+from dune_api import get_large_transfers
+from config import EXCHANGES, ALERT_INTERVAL
+import time
+
+
+def identify_flow(transfer):
+    try:
+        sender = transfer["sender"]
+        receiver = transfer["receiver"]
+
+        sender_name = next(
+            (name for name, addr in EXCHANGES.items() if addr == sender), None)
+        receiver_name = next(
+            (name for name, addr in EXCHANGES.items() if addr == receiver),
+            None)
+
+        if sender_name and receiver_name:
+            return f"🔀 {sender_name} → {receiver_name}"
+        elif sender_name:
+            return f"📤 Вывод с {sender_name}"
+        elif receiver_name:
+            return f"📥 Ввод на {receiver_name}"
+        return "❌ Неизвестное направление"
+    except Exception as e:
+        return f"⚠️ Ошибка идентификации: {str(e)}"
+
+
+def main():
+    print("🚀 Мониторинг переводов WLD запущен\n")
+    seen_transactions = set()
+
+    try:
+        while True:
+            transfers = get_large_transfers()
+
+            for t in transfers:
+                try:
+                    tx_id = f"{t['timestamp']}-{t['sender']}-{t['receiver']}-{t['amount']}"
+
+                    if tx_id not in seen_transactions:
+                        print(f"""
+                        {identify_flow(t)}
+                        💰 Сумма: {t['amount']:,.2f} WLD
+                        ⏰ Время: {t['timestamp']}
+                        Адреса: {t['sender']} → {t['receiver']}
+                        """)
+                        seen_transactions.add(tx_id)
+
+                except Exception as e:
+                    print(f"⚠️ Ошибка обработки транзакции: {str(e)}")
+                    print(f"Данные: {t}")
+
+            time.sleep(ALERT_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Мониторинг остановлен")
+    except Exception as e:
+        print(f"🚨 Критическая ошибка: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Настройки
+DUNE_API_KEY = os.getenv("DUNE_API_KEY")
+THRESHOLD = 50000  # Минимальная сумма для алерта (в WLD)
+ALERT_INTERVAL = 300  # Проверка каждые 5 минут
+
+# Адреса бирж (в нижнем регистре)
+EXCHANGES = {
+    "Binance": "0x28c6c06298d514db089934071355e5743bf21d60",
+    "OKX": "0x2c8fbb630289363ac80705a1a61273f76fd5a161"
+}
+
+# Контракт WLD
+WLD_CONTRACT = "0x163f8c2467924be0ae7b5347228cabf260318753"
+
+
+
+
+
+
+import requests
+import time
+from config import DUNE_API_KEY
+
+
+def debug_log(message):
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}] DEBUG: {message}")
+
+
+def get_large_transfers():
+    headers = {
+        "x-dune-api-key": DUNE_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # 1. Запуск выполнения
+        execute_url = "https://api.dune.com/api/v1/query/5141239/execute"
+        debug_log(f"Отправка POST на {execute_url}")
+
+        response = requests.post(execute_url, headers=headers)
+        debug_log(f"Статус: {response.status_code}")
+        debug_log(f"Ответ: {response.text[:200]}...")
+
+        response.raise_for_status()
+        execution_id = response.json()["execution_id"]
+        debug_log(f"Execution ID: {execution_id}")
+
+        # 2. Проверка статуса
+        status_url = f"https://api.dune.com/api/v1/execution/{execution_id}/status"
+
+        for attempt in range(10):
+            status = requests.get(status_url, headers=headers).json()
+            debug_log(f"Попытка {attempt+1}: {status['state']}")
+
+            if status["state"] == "QUERY_STATE_COMPLETED":
+                break
+            time.sleep(3)
+        else:
+            raise TimeoutError("Превышено время ожидания")
+
+        # 3. Получение результатов
+        results_url = f"https://api.dune.com/api/v1/execution/{execution_id}/results"
+        results = requests.get(results_url, headers=headers)
+        results.raise_for_status()
+
+        data = results.json()
+        debug_log(
+            f"Получено строк: {len(data.get('result', {}).get('rows', []))}")
+
+        # Форматирование данных
+        formatted_data = []
+        for row in data.get("result", {}).get("rows", []):
+            try:
+                formatted_data.append({
+                    "timestamp":
+                    row.get("evt_block_time", row.get("hour", "N/A")),
+                    "sender":
+                    row.get("from", "").lower(),
+                    "receiver":
+                    row.get("to", "").lower(),
+                    "amount":
+                    float(row.get("value", row.get("wld_received", 0)))
+                })
+            except Exception as e:
+                debug_log(f"Ошибка обработки строки: {e}\nДанные: {row}")
+
+        return formatted_data
+
+    except Exception as e:
+        debug_log(f"Ошибка: {str(e)}")
+        import traceback
+        debug_log(traceback.format_exc())
+        return []
