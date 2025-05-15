@@ -21,6 +21,13 @@ WITH exchange_addresses AS (
 
     -- NEXC
     UNION ALL SELECT 'NEXC', 0xd1f6a06e614eb10b880584684fe132caa6d4d95b
+),
+wld_price AS (
+  SELECT price
+  FROM prices.usd
+  WHERE symbol = 'WLD' AND blockchain = 'ethereum'
+  ORDER BY minute DESC
+  LIMIT 1
 )
 
 SELECT 
@@ -28,12 +35,17 @@ SELECT
     SUM(CASE WHEN t."to" = ex.address THEN CAST(t.value AS DOUBLE) ELSE 0 END) / 1e18
     - SUM(CASE WHEN t."from" = ex.address THEN CAST(t.value AS DOUBLE) ELSE 0 END) / 1e18 
     AS total_wld,
+    ROUND((
+        SUM(CASE WHEN t."to" = ex.address THEN CAST(t.value AS DOUBLE) ELSE 0 END) / 1e18
+      - SUM(CASE WHEN t."from" = ex.address THEN CAST(t.value AS DOUBLE) ELSE 0 END) / 1e18)
+    * wp.price, 2) AS total_usd_value,
     NOW() AS last_updated
 FROM exchange_addresses AS ex
 LEFT JOIN erc20_ethereum.evt_Transfer t
   ON t.contract_address = 0x163f8c2467924be0ae7b5347228cabf260318753
   AND (t."to" = ex.address OR t."from" = ex.address)
-GROUP BY ex.exchange
+CROSS JOIN wld_price wp
+GROUP BY ex.exchange, wp.price
 HAVING 
     SUM(CASE WHEN t."to" = ex.address THEN CAST(t.value AS DOUBLE) ELSE 0 END) / 1e18
     - SUM(CASE WHEN t."from" = ex.address THEN CAST(t.value AS DOUBLE) ELSE 0 END) / 1e18 > 0
